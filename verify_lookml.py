@@ -10,9 +10,13 @@ import numpy as np
 
 from concurrent.futures import ThreadPoolExecutor, wait
 
+IGNORABLE_SQL_ERROR = 'could not devise a query plan'
+
 
 def get_token_client():
     """
+    Authenticate user credentials and return token
+
     { LOOKER_BASE_URL, LOOKER_API_ID, LOOKER_API_SECRET } need to be set as environment variables
     """
     unauthenticated_client = looker.ApiClient(os.environ.get('LOOKER_BASE_URL'))
@@ -28,6 +32,7 @@ def get_token_client():
 
 def get_fields(model_explore_body):
     """
+    Create a list of dimensions and measures from the given model-explore
     """
     dimensions = [dimension.name for dimension in model_explore_body.fields.dimensions]
     measures = [measure.name for measure in model_explore_body.fields.measures]
@@ -36,8 +41,13 @@ def get_fields(model_explore_body):
 
 def check_for_query_error(query_id, token, timeout=3):
     """
+    Check for Looker error in query results
+
+    A timeout exception implies that the query is running successfully. The errors we care about
+    are ones that fail immediately
     """
     try:
+        # Using requests.get instead of API client in order to specify timeout
         endpoint = 'queries/' + str(query_id) + '/run/json'
         r = requests.get(
             os.environ.get('LOOKER_BASE_URL') + endpoint,
@@ -50,27 +60,34 @@ def check_for_query_error(query_id, token, timeout=3):
 
     for element in results:
         if 'looker_error' in element:
-            return (True, element['looker_error'])
+            return element['looker_error']
 
-    return (False, '')
+    return None
 
 
-def process_branch(query_client, token, branch, branch_queue, happy_queue, quasi_happy_queue, broken_field_queue, processed_field_queue):
+def process_branch(query_client, token, branch,
+                   branch_queue, happy_queue, quasi_happy_queue, broken_field_queue, processed_field_queue):
     """
+    Divide and conquer by splitting fields until field is proven innocent or guilty
+
+    1: If error and single field, you've found the guilty party
+    2: If error and not single field, you divide the fields and process both later
+    3: If no error and all original fields are present, the original model-explore is error free
+    4: If no error and some original fields are present, the original model-explore has a broken field
     """
     # Generate Query-ID
     query_id = generate_query_id(query_client, branch)
 
     # Check for query error
-    errored, message = check_for_query_error(query_id, token)
+    message = check_for_query_error(query_id, token)
 
-    ignorable_sql_error = 'could not devise a query plan'
-    if errored and ignorable_sql_error not in message:
+    if message and IGNORABLE_SQL_ERROR not in message:
         # If there is one field left then add it to error field queue
         model_name, explore_name, fields, starting_field_count = branch
         if len(fields) == 1:  # fields = ['xxxx.yyyy', 'xxxx.yyyy']
             broken_field_queue.put(branch)
-            [processed_field_queue.put(field) for field in fields]
+            for field in fields:
+                processed_field_queue.put(field)
         # Else split the field into two and put both back on the queue
         else:
             divided_branches = divide_branch(branch)
@@ -78,7 +95,8 @@ def process_branch(query_client, token, branch, branch_queue, happy_queue, quasi
                 branch_queue.put(divided_branch)
     else:
         model_name, explore_name, fields, starting_field_count = branch
-        [processed_field_queue.put(field) for field in fields]
+        for field in fields:
+            processed_field_queue.put(field)
         # If length of field equals all fields
         if len(fields) == starting_field_count:
             happy_queue.put(branch)
@@ -89,15 +107,18 @@ def process_branch(query_client, token, branch, branch_queue, happy_queue, quasi
 
 def divide_branch(branch):
     """
+    Split work into two
     """
     model_name, explore_name, fields, starting_field_count = branch
-    left_branch = fields[:len(fields)//2]
-    right_branch = fields[len(fields)//2:]
-    return [[model_name, explore_name, left_branch, starting_field_count], [model_name, explore_name, right_branch, starting_field_count]]
+    left_fields = fields[:len(fields)//2]
+    right_fields = fields[len(fields)//2:]
+    return [[model_name, explore_name, left_fields, starting_field_count],
+            [model_name, explore_name, right_fields, starting_field_count]]
 
 
 def generate_query_id(query_client, branch):
     """
+    Build the body of the query and return its ID
     """
     model_name, explore_name, fields, starting_field_count = branch
 
@@ -125,11 +146,17 @@ def main():
     # A generator of models that contain explores with content
     models = filter(is_checkable, model_client.all_lookml_models())
 
-    branch_queue = queue.Queue()            # Holds queries that need to be checked for errors
-    happy_queue = queue.Queue()             # Holds model-explores if all fields are error-free
-    quasi_happy_queue = queue.Queue()       # Holds model-explores if some fields are error-free
-    broken_field_queue = queue.Queue()      # Holds fields that produce errors
-    processed_field_queue = queue.Queue()   # Holds all fields that have been checked from the branch_queue
+    # Holds queries that need to be checked for errors
+    branch_queue = queue.Queue()
+    # Holds model-explores if all fields are error-free
+    happy_queue = queue.Queue()
+    # Holds model-explores if some fields are error-free
+    quasi_happy_queue = queue.Queue()
+    # Holds fields that produce errors
+    broken_field_queue = queue.Queue()
+    # Holds all fields that have been checked from the branch_queue
+    processed_field_queue = queue.Queue()
+
     for model in models:
         logging.info("Loading '{}' model".format(model.name))
         for explore_info in model.explores:
@@ -151,7 +178,8 @@ def main():
         try:
             branch = branch_queue.get(timeout=1)
             futures.append(
-                executor.submit(process_branch, query_client, token, branch, branch_queue, happy_queue, quasi_happy_queue, broken_field_queue, processed_field_queue)
+                executor.submit(process_branch, query_client, token, branch,
+                                branch_queue, happy_queue, quasi_happy_queue, broken_field_queue, processed_field_queue)
             )
         except queue.Empty:
             continue
